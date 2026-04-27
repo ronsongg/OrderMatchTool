@@ -445,15 +445,7 @@ class App(tk.Tk):
 
         tk.Button(btn_bar, text="复制库存列", command=self.copy_qty_col,
                   bg='#ffffff', fg=self.PRIMARY, font=('Microsoft YaHei', 10, 'bold'),
-                  relief='solid', bd=1, padx=14, pady=4, cursor='hand2').pack(side='left', padx=(0, 8))
-
-        tk.Button(btn_bar, text="复制全部（批次号+库存）", command=self.copy_all_cols,
-                  bg='#ffffff', fg=self.PRIMARY, font=('Microsoft YaHei', 10, 'bold'),
                   relief='solid', bd=1, padx=14, pady=4, cursor='hand2').pack(side='left', padx=(0, 16))
-
-        tk.Button(btn_bar, text="复制并删除记录", command=self.copy_and_delete,
-                  bg=self.SUCCESS, fg='white', font=('Microsoft YaHei', 10, 'bold'),
-                  relief='flat', padx=14, pady=4, cursor='hand2').pack(side='left', padx=(0, 8))
 
         tk.Button(btn_bar, text="仅删除记录", command=self.delete_only,
                   bg=self.DANGER, fg='white', font=('Microsoft YaHei', 10),
@@ -656,30 +648,20 @@ class App(tk.Tk):
         text = '\n'.join(str(r[3]) for r in self._match_result)
         self.clipboard_clear()
         self.clipboard_append(text)
-        self.show_status(f"已复制 {len(self._match_result)} 个库存")
+        n = len(self._match_result)
+        self.show_status(f"已复制 {n} 个库存")
 
-    def copy_all_cols(self):
-        if not self._check_result():
-            return
-        lines = [f"{r[1]}\t{r[3]}" for r in self._match_result]
-        text = '\n'.join(lines)
-        self.clipboard_clear()
-        self.clipboard_append(text)
-        self.show_status(f"已复制 {len(self._match_result)} 行（批次号+库存）")
-
-    def copy_and_delete(self):
-        if not self._check_result():
-            return
-        lines = [f"{r[1]}\t{r[3]}" for r in self._match_result]
-        text = '\n'.join(lines)
-        self.clipboard_clear()
-        self.clipboard_append(text)
-
-        ids = list(self._match_ids)
-        db_delete_ids(ids)
-        self.clear_results()
-        self.refresh_all()
-        self.show_status(f"已复制并删除 {len(ids)} 条记录")
+        # 复制完成后立即提醒用户是否删除已匹配的记录，避免漏删导致库存被重复领用
+        if messagebox.askyesno(
+            "是否删除记录",
+            f"已复制 {n} 个库存。\n是否同时从数据库中删除这 {n} 条已匹配的记录？\n\n"
+            "是 → 删除，避免下次再被匹配到\n否 → 保留，可稍后再点\"仅删除记录\""
+        ):
+            ids = list(self._match_ids)
+            db_delete_ids(ids)
+            self.clear_results()
+            self.refresh_all()
+            self.show_status(f"已复制并删除 {len(ids)} 条记录")
 
     def delete_only(self):
         if not self._check_result():
