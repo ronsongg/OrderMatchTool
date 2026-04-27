@@ -243,7 +243,8 @@ def find_col(headers, keywords):
 def find_best_match(items, target):
     """
     items: [(id, order_no, category, qty), ...]
-    用 DP 找最优方案（用最少的批次号数量凑出目标库存）
+    用 0/1 背包 DP 找最优方案（用最少的批次号数量凑出目标库存）
+    每条记录最多只会被使用一次。
     返回匹配列表或 None
     """
     n = min(len(items), 300)
@@ -255,29 +256,27 @@ def find_best_match(items, target):
 
     INF = float('inf')
     dp_count = [INF] * (target + 1)
-    dp_idx = [-1] * (target + 1)
-    dp_parent = [-1] * (target + 1)
+    # dp_path[s] 保存到达和 s 时所选 item 的完整索引列表（不可变快照）。
+    # 直接保存路径而不是 (idx, parent) 指针，避免后续迭代修改 dp_idx[s-q]
+    # 时污染已写入的 dp_path[s]，从而消除"同一条记录重复出现在结果中"的 bug。
+    dp_path = [None] * (target + 1)
     dp_count[0] = 0
+    dp_path[0] = []
 
     for i in range(len(lst)):
         q = lst[i][3]
+        if q <= 0 or q > target:
+            continue
         for s in range(target, q - 1, -1):
-            new_count = dp_count[s - q] + 1
-            if dp_count[s - q] < INF and new_count < dp_count[s]:
-                dp_count[s] = new_count
-                dp_idx[s] = i
-                dp_parent[s] = s - q
+            prev_count = dp_count[s - q]
+            if prev_count < INF and prev_count + 1 < dp_count[s]:
+                dp_count[s] = prev_count + 1
+                dp_path[s] = dp_path[s - q] + [i]
 
     if dp_count[target] == INF:
         return None
 
-    result = []
-    s = target
-    while s > 0:
-        idx = dp_idx[s]
-        result.append(lst[idx])
-        s = dp_parent[s]
-    return result
+    return [lst[i] for i in reversed(dp_path[target])]
 
 # ==================== GUI ====================
 class App(tk.Tk):
