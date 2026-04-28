@@ -129,6 +129,32 @@ def db_delete_ids(ids):
     conn.commit()
     conn.close()
 
+def db_consume_records(consumptions):
+    """
+    consumptions: [(id, consumed_qty), ...]
+    若 consumed_qty >= 当前 qty，则删除该行；否则把 qty 减去 consumed_qty。
+    用于支持"切件"消耗：同一批次记录可只领用部分库存。
+    """
+    if not consumptions:
+        return
+    conn = connect_db()
+    c = conn.cursor()
+    for rec_id, consumed in consumptions:
+        if consumed <= 0:
+            continue
+        c.execute('SELECT qty FROM orders WHERE id = ?', (rec_id,))
+        row = c.fetchone()
+        if row is None:
+            continue
+        current_qty = row[0]
+        new_qty = current_qty - consumed
+        if new_qty <= 0:
+            c.execute('DELETE FROM orders WHERE id = ?', (rec_id,))
+        else:
+            c.execute('UPDATE orders SET qty = ? WHERE id = ?', (new_qty, rec_id))
+    conn.commit()
+    conn.close()
+
 def db_clear():
     conn = connect_db()
     c = conn.cursor()
@@ -239,26 +265,18 @@ def find_col(headers, keywords):
                 return i
     return None
 
-# ==================== 匹配算法（只返回最优方案） ====================
-def find_best_match(items, target):
+# ==================== 匹配算法 ====================
+def _find_exact_subset(lst, target):
     """
-    items: [(id, order_no, category, qty), ...]
-    用 0/1 背包 DP 找最优方案（用最少的批次号数量凑出目标库存）
-    每条记录最多只会被使用一次。
-    返回匹配列表或 None
+    在 lst 中找一个**整批次精确凑出 target** 的子集，使用条数最少。
+    每条记录最多使用一次（0/1 背包）。
+    返回子集（lst 的子列表）或 None。
     """
-    n = min(len(items), 300)
-    lst = items[:n]
-
-    total = sum(r[3] for r in lst)
-    if total < target:
-        return None
-
     INF = float('inf')
     dp_count = [INF] * (target + 1)
-    # dp_path[s] 保存到达和 s 时所选 item 的完整索引列表（不可变快照）。
-    # 直接保存路径而不是 (idx, parent) 指针，避免后续迭代修改 dp_idx[s-q]
-    # 时污染已写入的 dp_path[s]，从而消除"同一条记录重复出现在结果中"的 bug。
+    # dp_path[s] 保存到达和 s 时所选 item 的完整索引列表（不可变快照），
+    # 避免后续迭代修改 dp_idx[s-q] 时污染已写入的 dp_path[s]，
+    # 从而消除"同一条记录重复出现在结果中"的 bug。
     dp_path = [None] * (target + 1)
     dp_count[0] = 0
     dp_path[0] = []
@@ -275,8 +293,60 @@ def find_best_match(items, target):
 
     if dp_count[target] == INF:
         return None
-
     return [lst[i] for i in reversed(dp_path[target])]
+
+
+def find_best_match(items, target):
+    """
+    items: [(id, order_no, category, qty), ...]
+    在某型号的全部批次中，找出使用条数最少的方案凑出 target 库存。
+    每条批次记录最多使用一次；最后一条允许"切件"（仅领用部分库存）。
+
+    返回 [(id, order_no, category, batch_qty, consumed_qty), ...] 或 None。
+    consumed_qty <= batch_qty；当 consumed_qty < batch_qty 时表示切件。
+
+    策略：
+    1) 先用 partial-greedy（按库存量降序贪心）算出"允许切件"下的最少条数 k_partial。
+    2) 再用 0/1 背包查"是否存在 k_partial 条整批次精确凑出 target"。
+       - 若存在：返回整批次方案（不切件，数据更干净）。
+       - 否则：返回 partial-greedy 方案（最后一条切件）。
+    数学上 k_partial <= k_exact 恒成立，所以这两种方案的批次数相同。
+    """
+    n = min(len(items), 300)
+    lst = items[:n]
+
+    if target <= 0:
+        return None
+
+    total = sum(r[3] for r in lst if r[3] > 0)
+    if total < target:
+        return None
+
+    # 1) partial-greedy：按 qty 降序取整批次直到累计 >= target，最后一条切件。
+    sorted_lst = sorted([r for r in lst if r[3] > 0], key=lambda r: -r[3])
+    cum = 0
+    picked = []
+    for r in sorted_lst:
+        picked.append(r)
+        cum += r[3]
+        if cum >= target:
+            break
+    if cum < target:
+        return None
+    k_partial = len(picked)
+
+    # 2) 尝试用同样的批次数找到整批次精确组合
+    exact = _find_exact_subset(lst, target)
+    if exact is not None and len(exact) == k_partial:
+        return [(r[0], r[1], r[2], r[3], r[3]) for r in exact]
+
+    # 3) 退化为切件方案：picked 的前 k_partial-1 条整批，最后一条切件
+    overflow = cum - target
+    last = picked[-1]
+    last_consumed = last[3] - overflow
+    result = [(r[0], r[1], r[2], r[3], r[3]) for r in picked[:-1]]
+    result.append((last[0], last[1], last[2], last[3], last_consumed))
+    return result
 
 # ==================== GUI ====================
 class App(tk.Tk):
@@ -295,7 +365,8 @@ class App(tk.Tk):
         self.configure(bg=self.BG)
 
         self._match_result = None
-        self._match_ids = []
+        # _match_consumptions: [(id, consumed_qty), ...]，用于删除时按实际消耗量更新数据库
+        self._match_consumptions = []
 
         self._setup_styles()
         self._build_ui()
@@ -585,7 +656,7 @@ class App(tk.Tk):
         match = find_best_match(items, target_qty)
         if not match:
             messagebox.showinfo("结果",
-                f"未找到库存之和等于 {target_qty} 的组合\n"
+                f"无法凑出 {target_qty} 件库存\n"
                 f"该型号共 {len(items)} 条记录，总库存 {total_avail}")
             return
 
@@ -594,26 +665,38 @@ class App(tk.Tk):
     # ==================== 结果展示 ====================
     def clear_results(self):
         self._match_result = None
-        self._match_ids = []
+        self._match_consumptions = []
         self.result_title.config(text="")
         for item in self.res_tree.get_children():
             self.res_tree.delete(item)
 
     def show_result(self, match):
+        # match: [(id, order_no, category, batch_qty, consumed_qty), ...]
         self._match_result = match
-        self._match_ids = [r[0] for r in match]
+        self._match_consumptions = [(r[0], r[4]) for r in match]
 
-        sum_qty = sum(r[3] for r in match)
-        self.result_title.config(
-            text=f"匹配结果：{len(match)} 个批次号，总库存 {sum_qty}"
-        )
+        sum_consumed = sum(r[4] for r in match)
+        partial_count = sum(1 for r in match if r[4] < r[3])
+        if partial_count:
+            title = (f"匹配结果：{len(match)} 个批次号（含 {partial_count} 个切件），"
+                     f"总库存 {sum_consumed}")
+        else:
+            title = f"匹配结果：{len(match)} 个批次号，总库存 {sum_consumed}"
+        self.result_title.config(text=title)
 
         for item in self.res_tree.get_children():
             self.res_tree.delete(item)
 
         for i, r in enumerate(match):
+            batch_qty = r[3]
+            consumed_qty = r[4]
+            if consumed_qty < batch_qty:
+                # 切件：同时呈现领用数与原批库存，便于用户核对
+                qty_text = f"{consumed_qty} / {batch_qty}"
+            else:
+                qty_text = str(consumed_qty)
             tag = 'even' if i % 2 == 0 else 'odd'
-            self.res_tree.insert('', 'end', values=(i + 1, r[1], r[3]), tags=(tag,))
+            self.res_tree.insert('', 'end', values=(i + 1, r[1], qty_text), tags=(tag,))
 
         self.res_tree.tag_configure('even', background='#ffffff')
         self.res_tree.tag_configure('odd', background='#f0f4ff')
@@ -645,32 +728,42 @@ class App(tk.Tk):
     def copy_qty_col(self):
         if not self._check_result():
             return
-        text = '\n'.join(str(r[3]) for r in self._match_result)
+        # 库存列复制的是本次领用量（切件后的实际领用数），而非原批库存
+        text = '\n'.join(str(r[4]) for r in self._match_result)
         self.clipboard_clear()
         self.clipboard_append(text)
         n = len(self._match_result)
         self.show_status(f"已复制 {n} 个库存")
 
+        partial_count = sum(1 for r in self._match_result if r[4] < r[3])
+        if partial_count:
+            extra = (f"\n其中 {partial_count} 个为切件领用，"
+                     f"删除时全领用的批次会被删行，"
+                     f"切件的批次只会从原库存中减去领用量。")
+        else:
+            extra = ""
+
         # 复制完成后立即提醒用户是否删除已匹配的记录，避免漏删导致库存被重复领用
         if messagebox.askyesno(
             "是否删除记录",
-            f"已复制 {n} 个库存。\n是否同时从数据库中删除这 {n} 条已匹配的记录？\n\n"
-            "是 → 删除，避免下次再被匹配到\n否 → 保留，可稍后再点\"仅删除记录\""
+            f"已复制 {n} 个库存。\n是否同时从数据库中扣减本次领用量？{extra}\n\n"
+            "是 → 扣减 / 删除，避免下次再被重复领用\n"
+            "否 → 保留，可稍后再点\"仅删除记录\""
         ):
-            ids = list(self._match_ids)
-            db_delete_ids(ids)
+            consumptions = list(self._match_consumptions)
+            db_consume_records(consumptions)
             self.clear_results()
             self.refresh_all()
-            self.show_status(f"已复制并删除 {len(ids)} 条记录")
+            self.show_status(f"已复制并领用 {len(consumptions)} 条记录")
 
     def delete_only(self):
         if not self._check_result():
             return
-        n = len(self._match_ids)
-        db_delete_ids(list(self._match_ids))
+        n = len(self._match_consumptions)
+        db_consume_records(list(self._match_consumptions))
         self.clear_results()
         self.refresh_all()
-        self.show_status(f"已删除 {n} 条记录")
+        self.show_status(f"已领用 {n} 条记录")
 
 # ==================== Main ====================
 if __name__ == '__main__':
