@@ -37,3 +37,4 @@ jobs:
           name: OrderMatchTool-windows-exe
           path: dist/OrderMatchTool.exe
           if-no-files-found: error
+          retention-days: 3
